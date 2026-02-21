@@ -8,7 +8,7 @@ scheduler callbacks.
 from __future__ import annotations
 
 import random
-from typing import List
+from typing import List, Tuple
 
 from simulator.core import Core
 from simulator.scheduler_base import SchedulerBase
@@ -56,6 +56,78 @@ class Simulation:
         self._current_time: int = 0
         self._rng: random.Random = random.Random(seed)
         self._blocked_tasks: List[Task] = []
+        self._task_cursor: int = 0
+        self._completed_count: int = 0
+
+    def step_tick(
+        self,
+    ) -> Tuple[List[int], List[Task], bool, dict]:
+        """Run one tick (phases 1-4 only). Caller must dispatch to idle cores.
+
+        Returns:
+            idle_core_ids: Core indices that are idle after this tick.
+            completed_this_tick: Tasks that completed this tick.
+            done: True if all tasks have completed.
+            info: Dict with e.g. 'current_time' for debugging.
+        """
+        total_tasks = len(self._tasks)
+        completed_this_tick: List[Task] = []
+
+        # 1. Admit newly arrived tasks.
+        while (
+            self._task_cursor < total_tasks
+            and self._tasks[self._task_cursor].arrival_time <= self._current_time
+        ):
+            self._scheduler.add_task(self._tasks[self._task_cursor])
+            self._task_cursor += 1
+
+        # 2. Advance I/O-blocked tasks.
+        still_blocked: List[Task] = []
+        for task in self._blocked_tasks:
+            if task.tick_io_block():
+                self._scheduler.on_task_unblocked(task)
+            else:
+                still_blocked.append(task)
+        self._blocked_tasks = still_blocked
+
+        # 3. Check preemption on busy cores.
+        for core in self._cores:
+            if core.current_task is not None and core.context_switch_remaining == 0:
+                if self._scheduler.check_preemption(
+                    core.core_id,
+                    core.current_task,
+                    core.ticks_on_core,
+                    self._current_time,
+                ):
+                    preempted = core.preempt()
+                    if preempted is not None:
+                        self._scheduler.add_task(preempted)
+
+        # 4. Tick every core.
+        for core in self._cores:
+            task, result = core.tick(self._current_time, self._rng)
+
+            if result is TickResult.COMPLETED:
+                assert task is not None
+                self._scheduler.on_task_complete(task)
+                self._completed_count += 1
+                completed_this_tick.append(task)
+            elif result is TickResult.IO_BLOCKED:
+                assert task is not None
+                self._scheduler.on_task_blocked(task)
+                self._blocked_tasks.append(task)
+
+        self._current_time += 1
+
+        idle_core_ids = [c.core_id for c in self._cores if c.is_idle()]
+        done = self._completed_count >= total_tasks
+        info: dict = {"current_time": self._current_time - 1}
+
+        return idle_core_ids, completed_this_tick, done, info
+
+    def dispatch(self, core_id: int, task: Task) -> None:
+        """Assign a task to a core. Used when env drives dispatch (no scheduler call)."""
+        self._cores[core_id].assign_task(task)
 
     def run(self) -> List[Task]:
         """Execute the full simulation and return the completed task list.

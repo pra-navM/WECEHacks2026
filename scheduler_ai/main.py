@@ -18,6 +18,7 @@ SCHEDULERS: Dict[str, Type[SchedulerBase]] = {
     "rr": RoundRobinScheduler,
     "sjf": SJFScheduler,
 }
+SCHEDULER_CHOICES = ["fcfs", "rr", "sjf", "rl"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,9 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scheduler",
         type=str,
-        choices=list(SCHEDULERS.keys()),
+        choices=SCHEDULER_CHOICES,
         default="fcfs",
-        help="Scheduling policy (default: fcfs)",
+        help="Scheduling policy: fcfs, rr, sjf, or rl (default: fcfs)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="rl/checkpoints/ppo_scheduler.zip",
+        help="Path to trained RL model when using --scheduler rl (default: rl/checkpoints/ppo_scheduler.zip)",
     )
     parser.add_argument(
         "--tasks",
@@ -47,8 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed for workload generation (default: 42)",
+        default=67,
+        help="Random seed for workload generation (default: 67)",
     )
     parser.add_argument(
         "--quantum",
@@ -72,10 +79,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_scheduler(name: str, quantum: int) -> SchedulerBase:
+def make_scheduler(
+    name: str,
+    quantum: int,
+    num_cores: int = 2,
+    model_path: str | None = None,
+) -> SchedulerBase:
     """Instantiate the requested scheduler."""
     if name == "rr":
         return RoundRobinScheduler(time_quantum=quantum)
+    if name == "rl":
+        import os
+        from sb3_contrib import MaskablePPO
+        from rl.agent import RLScheduler
+        
+        path = model_path or "rl/checkpoints/ppo_scheduler.zip"
+        # Normalize path and ensure it doesn't have double .zip extension
+        if path.endswith(".zip.zip"):
+            path = path[:-4]  # Remove one .zip
+        elif not path.endswith(".zip"):
+            path = path + ".zip"
+        
+        # Check if file exists
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"RL model not found at '{path}'. "
+                f"Please train a model first using:\n"
+                f"  python -m rl.train --timesteps 200000 --save {path}\n"
+                f"Or specify a different model path with --model <path>"
+            )
+        
+        model = MaskablePPO.load(path)
+        return RLScheduler(model=model, num_cores=num_cores, max_queue_len=32)
     return SCHEDULERS[name]()
 
 
@@ -136,7 +171,12 @@ def main(argv: list[str] | None = None) -> None:
     else:
         workload = generate_workload(num_tasks=args.tasks, seed=args.seed)
 
-    scheduler = make_scheduler(args.scheduler, args.quantum)
+    scheduler = make_scheduler(
+        args.scheduler,
+        args.quantum,
+        num_cores=args.cores,
+        model_path=args.model if args.scheduler == "rl" else None,
+    )
 
     sim = Simulation(
         num_cores=args.cores,
