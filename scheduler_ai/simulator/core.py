@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from typing import Optional
 
-from scheduler_ai.simulator.task import Task, TickResult
+from simulator.task import Task, TickResult
 
 
 class Core:

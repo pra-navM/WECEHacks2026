@@ -1,1 +1,1 @@
-from scheduler_ai.workload.generator import generate_workload, generate_workload_mixed
+from .generator import generate_workload, generate_workload_mixed

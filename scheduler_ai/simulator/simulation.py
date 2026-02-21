@@ -10,9 +10,9 @@ from __future__ import annotations
 import random
 from typing import List
 
-from scheduler_ai.simulator.core import Core
-from scheduler_ai.simulator.scheduler_base import SchedulerBase
-from scheduler_ai.simulator.task import Task, TickResult
+from simulator.core import Core
+from simulator.scheduler_base import SchedulerBase
+from simulator.task import Task, TickResult
 
 
 class Simulation:

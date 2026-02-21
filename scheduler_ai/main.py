@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 from typing import Dict, List, Type
 
-from scheduler_ai.simulator.fcfs import FCFSScheduler
-from scheduler_ai.simulator.round_robin import RoundRobinScheduler
-from scheduler_ai.simulator.scheduler_base import SchedulerBase
-from scheduler_ai.simulator.simulation import Simulation
-from scheduler_ai.simulator.sjf import SJFScheduler
-from scheduler_ai.simulator.task import Task
-from scheduler_ai.workload.generator import generate_workload, generate_workload_mixed
+from simulator.fcfs import FCFSScheduler
+from simulator.round_robin import RoundRobinScheduler
+from simulator.scheduler_base import SchedulerBase
+from simulator.simulation import Simulation
+from simulator.sjf import SJFScheduler
+from simulator.task import Task
+from workload.generator import generate_workload, generate_workload_mixed
 
 SCHEDULERS: Dict[str, Type[SchedulerBase]] = {
     "fcfs": FCFSScheduler,

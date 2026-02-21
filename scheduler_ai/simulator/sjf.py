@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from scheduler_ai.simulator.scheduler_base import SchedulerBase
-from scheduler_ai.simulator.task import Task
+from simulator.scheduler_base import SchedulerBase
+from simulator.task import Task
 
 
 class SJFScheduler(SchedulerBase):

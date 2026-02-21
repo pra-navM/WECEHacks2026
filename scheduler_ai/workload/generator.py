@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from typing import List
 
-from scheduler_ai.simulator.task import Task, TaskMetadata
+from simulator.task import Task, TaskMetadata
 
 
 def generate_workload(

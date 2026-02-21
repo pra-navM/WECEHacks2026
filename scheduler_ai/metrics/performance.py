@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from scheduler_ai.simulator.task import Task
+from simulator.task import Task
 
 
 def compute_metrics(tasks: List[Task]) -> Dict[str, float]:
