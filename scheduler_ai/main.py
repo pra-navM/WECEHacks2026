@@ -18,13 +18,19 @@ SCHEDULERS: Dict[str, Type[SchedulerBase]] = {
     "rr": RoundRobinScheduler,
     "sjf": SJFScheduler,
 }
-SCHEDULER_CHOICES = ["fcfs", "rr", "sjf", "rl"]
+SCHEDULER_CHOICES = ["fcfs", "rr", "sjf", "rl", "governor", "fast-governor"]
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="Multicore CPU Scheduling Simulator",
+    )
+    parser.add_argument(
+    "--onnx-model",
+    type=str,
+    default="rl/governor_int8.onnx",
+    help="Path to quantized ONNX model for fast-governor (default: rl/governor_int8.onnx)",
     )
     parser.add_argument(
         "--cores",
@@ -88,31 +94,37 @@ def make_scheduler(
     """Instantiate the requested scheduler."""
     if name == "rr":
         return RoundRobinScheduler(time_quantum=quantum)
-    if name == "rl":
-        import os
-        from sb3_contrib import MaskablePPO
-        from rl.agent import RLScheduler
-        
-        path = model_path or "rl/checkpoints/ppo_scheduler.zip"
-        # Normalize path and ensure it doesn't have double .zip extension
-        if path.endswith(".zip.zip"):
-            path = path[:-4]  # Remove one .zip
-        elif not path.endswith(".zip"):
-            path = path + ".zip"
-        
-        # Check if file exists
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"RL model not found at '{path}'. "
-                f"Please train a model first using:\n"
-                f"  python -m rl.train --timesteps 200000 --save {path}\n"
-                f"Or specify a different model path with --model <path>"
-            )
-        
-        model = MaskablePPO.load(path)
-        return RLScheduler(model=model, num_cores=num_cores, max_queue_len=32)
-    return SCHEDULERS[name]()
 
+    # In main.py -> make_scheduler()
+    if name == "fast-governor":
+        from rl.agent import QuantizedGovernor
+        # Use the path passed from CLI or the default
+        return QuantizedGovernor(model_path=model_path or "rl/governor_int8.onnx", num_cores=num_cores)
+    
+    # Use standard PPO for both 'rl' and 'governor' if that's what you trained with
+    if name in ("rl", "governor"):
+        import os
+        from stable_baselines3 import PPO  # Use standard PPO to match train.py
+        from rl.agent import RLScheduler, GovernorScheduler
+        
+        # Determine correct path based on the name
+        default_path = "rl/checkpoints/scheduler_pro_v1.zip" if name == "governor" else "rl/checkpoints/ppo_scheduler.zip"
+        path = model_path or default_path
+        
+        # Cleanup path
+        if path.endswith(".zip.zip"): path = path[:-4]
+        elif not path.endswith(".zip"): path = path + ".zip"
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model not found at {path}. Train it first!")
+        
+        model = PPO.load(path)
+        
+        if name == "rl":
+            return RLScheduler(model=model, num_cores=num_cores, max_queue_len=32)
+        else:
+            return GovernorScheduler(model=model, num_cores=num_cores, max_queue_len=32)
+    return SCHEDULERS[name]()
 
 def print_results(
     tasks: List[Task],

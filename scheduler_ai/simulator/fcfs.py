@@ -21,7 +21,7 @@ class FCFSScheduler(SchedulerBase):
     def add_task(self, task: Task) -> None:
         self._queue.append(task)
 
-    def get_next_task(self, current_time: int) -> Optional[Task]:
+    def get_next_task(self, current_time: int, **kwargs: object) -> Optional[Task]:
         if self._queue:
             return self._queue.popleft()
         return None

@@ -277,3 +277,242 @@ def build_obs_for_agent(
     """Build observation vector (same encoding as env). Used by RLScheduler at inference."""
     num_idle = 0  # Agent doesn't have core state; use 0 or pass if available
     return _build_obs(current_time, num_cores, num_idle, queue, max_queue_len)
+
+
+# --- Governor (hardware-aware) env: Box(3) action = [W_Length, W_Affinity, W_Thermal] ---
+CONTEXT_SWITCH_COST_DEFAULT = 7
+CACHE_LOCALITY_COST = 15
+
+
+def _build_governor_obs(
+    current_time: int,
+    num_cores: int,
+    idle_core_ids: List[int],
+    core_heats: List[float],
+    queue: List[Task],
+    max_queue_len: int,
+) -> np.ndarray:
+    """Observation for governor: global + per-core heat + per-task (remaining, last_core)."""
+    t_norm = min(1.0, current_time / MAX_TIME)
+    n_ready = min(len(queue), max_queue_len)
+    global_part = np.array(
+        [t_norm, len(idle_core_ids) / max(1, num_cores), n_ready / max_queue_len, num_cores / 8.0],
+        dtype=np.float32,
+    )
+    # Per-core heat (for all cores so size is fixed)
+    heat_part = np.array([core_heats[i] if i < len(core_heats) else 0.0 for i in range(num_cores)], dtype=np.float32)
+    # Per-task: remaining_time, last_core_id (normalized 0-1, or -1 if none)
+    task_part = []
+    for i in range(max_queue_len):
+        if i < len(queue):
+            t = queue[i]
+            last = (t.last_core_id / num_cores) if t.last_core_id is not None else -1.0
+            task_part.extend([t.remaining_time / MAX_BURST, t.arrival_time / MAX_TIME, t.burst_time / MAX_BURST, last])
+        else:
+            task_part.extend([0.0, 0.0, 0.0, -1.0])
+    task_part = np.array(task_part, dtype=np.float32)
+    return np.concatenate([global_part, heat_part, task_part])
+
+
+def _governor_score_task_core(
+    task: Task,
+    core_id: int,
+    core_heat: float,
+    weights: np.ndarray,
+    num_cores: int,
+) -> float:
+    """Core_Score = (1/len)*W_Length + Affinity*W_Affinity + (1-Heat)*W_Thermal."""
+    w_length, w_affinity, w_thermal = weights[0], weights[1], weights[2]
+    inv_len = 1.0 / max(1, task.remaining_time)  # prefer short
+    affinity = 1.0 if (task.last_core_id is not None and task.last_core_id == core_id) else 0.0
+    cool = 1.0 - core_heat  # prefer cool cores
+    return inv_len * w_length + affinity * w_affinity + cool * w_thermal
+
+
+class GovernorSchedulerEnv(gym.Env if gym else object):
+    """Governor-style env: action Box(3) = [W_Length, W_Affinity, W_Thermal], hardware friction."""
+
+    def __init__(
+        self,
+        num_cores: int = 2,
+        max_queue_len: int = 32,
+        context_switch_cost: int = CONTEXT_SWITCH_COST_DEFAULT,
+        cache_locality_cost: int = CACHE_LOCALITY_COST,
+        seed: Optional[int] = None,
+        workload_type: str = "mixed",
+        num_tasks_range: Tuple[int, int] = (20, 50),
+        episode_timeout: int = 2000,
+    ) -> None:
+        if gym is None or spaces is None:
+            raise ImportError("gymnasium is required. Install with: pip install gymnasium")
+        self.num_cores = num_cores
+        self.max_queue_len = max_queue_len
+        self.context_switch_cost = context_switch_cost
+        self.cache_locality_cost = cache_locality_cost
+        self.workload_type = workload_type
+        self.num_tasks_range = num_tasks_range
+        self.episode_timeout = episode_timeout
+
+        obs_dim = 4 + num_cores + max_queue_len * 4
+        self.observation_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(obs_dim,),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(3,),
+            dtype=np.float32,
+        )  # [W_Length, W_Affinity, W_Thermal]
+
+        self._rng = random.Random(seed)
+        self._sim: Optional[Simulation] = None
+        self._scheduler: Optional[_QueueOnlyScheduler] = None
+        self._idle_core_ids: List[int] = []
+        self._episode_cs_penalty: float = 0.0
+        self._episode_throttling: int = 0
+        self._episode_waits: List[float] = []
+
+    def _make_workload(self, seed: Optional[int] = None) -> List[Task]:
+        n = self._rng.randint(*self.num_tasks_range)
+        s = seed if seed is not None else self._rng.randint(0, 2**31 - 1)
+        if self.workload_type == "mixed":
+            return generate_workload_mixed(num_tasks=n, seed=s)
+        return generate_workload(num_tasks=n, seed=s)
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ) -> Tuple[np.ndarray, dict]:
+        if seed is not None:
+            self._rng = random.Random(seed)
+        tasks = self._make_workload(seed=seed)
+        self._scheduler = _QueueOnlyScheduler()
+        self._sim = Simulation(
+            num_cores=self.num_cores,
+            scheduler=self._scheduler,
+            tasks=tasks,
+            context_switch_cost=self.context_switch_cost,
+            cache_locality_cost=self.cache_locality_cost,
+            seed=self._rng.randint(0, 2**31 - 1),
+        )
+        self._idle_core_ids = []
+        self._episode_cs_penalty = 0.0
+        self._episode_throttling = 0
+        self._episode_waits = []
+
+        while True:
+            idle_core_ids, completed, done, info = self._sim.step_tick()
+            self._idle_core_ids = idle_core_ids
+            self._episode_throttling += info.get("throttling_events", 0)
+            for t in completed:
+                if t.waiting_time is not None:
+                    self._episode_waits.append(float(t.waiting_time))
+            if done:
+                break
+            if idle_core_ids and self._scheduler.has_pending_tasks():
+                break
+            if self._sim._current_time >= self.episode_timeout:
+                done = True
+                break
+
+        core_heats = [self._sim._cores[i].get_heat_normalized() for i in range(self.num_cores)]
+        queue = self._scheduler.get_queue()
+        obs = _build_governor_obs(
+            self._sim._current_time - 1,
+            self.num_cores,
+            self._idle_core_ids,
+            core_heats,
+            queue,
+            self.max_queue_len,
+        )
+        return obs, {}
+
+    def step(
+        self,
+        action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        if self._sim is None or self._scheduler is None:
+            raise RuntimeError("Call reset() first")
+
+        reward = 0.0
+        weights = np.clip(np.asarray(action, dtype=np.float32).ravel()[:3], -1.0, 1.0)
+        queue = self._scheduler.get_queue()
+        core_heats = [self._sim._cores[i].get_heat_normalized() for i in range(self.num_cores)]
+
+        # Assign (task, core) greedily by governor score
+        while self._idle_core_ids and self._scheduler.has_pending_tasks():
+            q = self._scheduler.get_queue()
+            if not q:
+                break
+            best_score = -1e9
+            best_qi, best_cid = 0, self._idle_core_ids[0]
+            for qi, task in enumerate(q):
+                for cid in self._idle_core_ids:
+                    h = core_heats[cid]
+                    sc = _governor_score_task_core(task, cid, h, weights, self.num_cores)
+                    if sc > best_score:
+                        best_score = sc
+                        best_qi = qi
+                        best_cid = cid
+            task = self._scheduler.remove_and_get_at(best_qi)
+            penalty = self._sim.dispatch(best_cid, task)
+            self._episode_cs_penalty += penalty
+            reward -= float(penalty)
+            self._idle_core_ids = [c for c in self._idle_core_ids if c != best_cid]
+            core_heats[best_cid] = self._sim._cores[best_cid].get_heat_normalized()
+
+        # Advance one tick
+        idle_core_ids, completed_this_tick, done, info = self._sim.step_tick()
+        self._idle_core_ids = idle_core_ids
+        te = info.get("throttling_events", 0)
+        self._episode_throttling += te
+        reward -= te * 100.0
+
+        for t in completed_this_tick:
+            if t.waiting_time is not None:
+                self._episode_waits.append(float(t.waiting_time))
+
+        truncated = self._sim._current_time >= self.episode_timeout and not done
+
+        while not done and not truncated:
+            if self._idle_core_ids and self._scheduler.has_pending_tasks():
+                core_heats = [self._sim._cores[i].get_heat_normalized() for i in range(self.num_cores)]
+                queue = self._scheduler.get_queue()
+                obs = _build_governor_obs(
+                    self._sim._current_time - 1,
+                    self.num_cores,
+                    self._idle_core_ids,
+                    core_heats,
+                    queue,
+                    self.max_queue_len,
+                )
+                return obs, reward, False, False, {}
+            idle_core_ids, completed_this_tick, done, info = self._sim.step_tick()
+            self._idle_core_ids = idle_core_ids
+            te = info.get("throttling_events", 0)
+            self._episode_throttling += te
+            reward -= te * 100.0
+            for t in completed_this_tick:
+                if t.waiting_time is not None:
+                    self._episode_waits.append(float(t.waiting_time))
+            truncated = self._sim._current_time >= self.episode_timeout and not done
+
+        # Terminal: add -avg_wait (CS and throttling already added per-step)
+        avg_wait = (sum(self._episode_waits) / len(self._episode_waits)) if self._episode_waits else 0.0
+        reward -= avg_wait
+
+        core_heats = [self._sim._cores[i].get_heat_normalized() for i in range(self.num_cores)]
+        queue = self._scheduler.get_queue()
+        obs = _build_governor_obs(
+            self._sim._current_time - 1,
+            self.num_cores,
+            self._idle_core_ids,
+            core_heats,
+            queue,
+            self.max_queue_len,
+        )
+        return obs, reward, done, truncated, {}

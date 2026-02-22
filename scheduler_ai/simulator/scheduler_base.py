@@ -30,11 +30,12 @@ class SchedulerBase(ABC):
         """
 
     @abstractmethod
-    def get_next_task(self, current_time: int) -> Optional[Task]:
+    def get_next_task(self, current_time: int, **kwargs: object) -> Optional[Task]:
         """Select and remove the next task to run on an idle core.
 
         Args:
             current_time: The current simulation clock value.
+            **kwargs: Optional context (e.g. core_id, core_heat for governor).
 
         Returns:
             The chosen Task, or None if no task is ready.

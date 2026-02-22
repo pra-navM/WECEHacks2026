@@ -43,13 +43,19 @@ class Simulation:
         scheduler: SchedulerBase,
         tasks: List[Task],
         context_switch_cost: int = 0,
+        cache_locality_cost: int = 0,
         seed: int = 0,
     ) -> None:
         if num_cores <= 0:
             raise ValueError(f"num_cores must be positive, got {num_cores}")
 
         self._cores: List[Core] = [
-            Core(i, context_switch_cost=context_switch_cost) for i in range(num_cores)
+            Core(
+                i,
+                context_switch_cost=context_switch_cost,
+                cache_locality_cost=cache_locality_cost,
+            )
+            for i in range(num_cores)
         ]
         self._scheduler: SchedulerBase = scheduler
         self._tasks: List[Task] = sorted(tasks, key=lambda t: t.arrival_time)
@@ -104,8 +110,11 @@ class Simulation:
                         self._scheduler.add_task(preempted)
 
         # 4. Tick every core.
+        throttling_events_this_tick = 0
         for core in self._cores:
-            task, result = core.tick(self._current_time, self._rng)
+            task, result, was_throttled = core.tick(self._current_time, self._rng)
+            if was_throttled:
+                throttling_events_this_tick += 1
 
             if result is TickResult.COMPLETED:
                 assert task is not None
@@ -121,13 +130,16 @@ class Simulation:
 
         idle_core_ids = [c.core_id for c in self._cores if c.is_idle()]
         done = self._completed_count >= total_tasks
-        info: dict = {"current_time": self._current_time - 1}
+        info: dict = {
+            "current_time": self._current_time - 1,
+            "throttling_events": throttling_events_this_tick,
+        }
 
         return idle_core_ids, completed_this_tick, done, info
 
-    def dispatch(self, core_id: int, task: Task) -> None:
-        """Assign a task to a core. Used when env drives dispatch (no scheduler call)."""
-        self._cores[core_id].assign_task(task)
+    def dispatch(self, core_id: int, task: Task) -> int:
+        """Assign a task to a core. Returns context-switch + cache-locality penalty."""
+        return self._cores[core_id].assign_task(task)
 
     def run(self) -> List[Task]:
         """Execute the full simulation and return the completed task list.
@@ -173,7 +185,7 @@ class Simulation:
 
             # 4. Tick every core.
             for core in self._cores:
-                task, result = core.tick(self._current_time, self._rng)
+                task, result, _ = core.tick(self._current_time, self._rng)
 
                 if result is TickResult.COMPLETED:
                     assert task is not None
@@ -187,7 +199,11 @@ class Simulation:
             # 5. Dispatch tasks to idle cores.
             for core in self._cores:
                 if core.is_idle():
-                    next_task = self._scheduler.get_next_task(self._current_time)
+                    next_task = self._scheduler.get_next_task(
+                        self._current_time,
+                        core_id=core.core_id,
+                        core_heat=core.get_heat_normalized(),
+                    )
                     if next_task is not None:
                         core.assign_task(next_task)
 
